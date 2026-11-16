@@ -1298,7 +1298,184 @@
         .bear-pet.walking .bh-pal-walk{display:block;width:100%;height:100%}
         .bear-pet.walking .bh-pal-walk { animation: palWalk .38s ease-in-out infinite; }
 /*/YC-THEME*/
+        /*YC-SYNC-CSS*/
+        #ycSyncChip { display: inline-flex; align-items: center; gap: 5px; height: 22px; margin-left: 6px; padding: 0 8px; border: 0; border-radius: 999px;
+            background: rgba(167,139,250,.14); color: #7c6bb0; font: inherit; font-size: 10.5px; font-weight: 800; cursor: pointer; letter-spacing: .3px; }
+        #ycSyncChip b { font-size: 11px; color: #5f4f92; letter-spacing: 1px; }
+        #ycSyncChip.good { background: rgba(124,193,145,.18); color: #4f8a63; }
+        #ycSyncChip.good b { color: #3d7250; }
+        #ycSyncChip.bad { background: rgba(244,183,120,.2); color: #9a7433; }
+        #ycSyncChip.bad b { color: #8a6423; }
+/*/YC-SYNC-CSS*/
     </style>
+<script>
+// <<YC-SYNC>>
+/* 进度同步：把学习进度和熊的养成存到服务器，按 6 位同步码认人。
+   有后端（局域网服务或你自己的域名）→ 全自动同步；
+   没有后端（GitHub Pages / 双击本地文件）→ 静默退回本机存档，页面照常可用。 */
+(function () {
+    const web = /^https?:$/.test(location.protocol);
+    const BASE = (window.YC_SYNC_BASE || '').replace(/\/$/, '') || (web && !/\.github\.io$/.test(location.hostname) ? location.origin : '');
+    const API = BASE + '/' + 'api' + '/';
+    const K_CODE = 'yc_sync_code', K_T = 'tutorial_completed', K_F = 'tutorial_favorites', K_B = 'bear_handdrawn_v1', K_L = 'bear_love';
+    let ok = web && !!BASE;
+    let code = '', busy = 0, pushT = 0, dirty = false, chip = null, status = '';
+
+    const setItem = Storage.prototype.setItem;
+    const raw = (k, v) => setItem.call(localStorage, k, v);
+    try { code = (location.hash.match(/code=([A-Z0-9]{6})/) || [])[1] || localStorage.getItem(K_CODE) || ''; if (code) raw(K_CODE, code); } catch (e) {}
+
+    const read = k => { try { return JSON.parse(localStorage.getItem(k) || 'null'); } catch (e) { return null; } };
+    const api = (p, body) => fetch(API + p, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body), cache: 'no-store'
+    }).then(r => r.json());
+
+    const pack = () => ({
+        tutorial: { completed: read(K_T) || {}, favorites: read(K_F) || {} },
+        completed: read(K_T) || {},
+        favorites: read(K_F) || {},
+        bear: { state: read(K_B) || {}, love: +localStorage.getItem(K_L) || 0 }
+    });
+
+    function merge(oldC, newC) {
+        const out = {};
+        [oldC || {}, newC || {}].forEach(src => {
+            for (const k in src) {
+                const a = out[k] || [], b = src[k] || [];
+                out[k] = a.concat(b.filter(x => a.indexOf(x) < 0));
+            }
+        });
+        return out;
+    }
+    // 服务器存档并进本机：教程完成/收藏取并集，熊的存档按 savedAt 新的为准。返回本机是否有变化
+    function apply(st) {
+        if (!st) return false;
+        let changed = false;
+        const put = (k, v) => { if (localStorage.getItem(k) !== v) { raw(k, v); changed = true; } };
+        put(K_T, JSON.stringify(merge(read(K_T), st.completed)));
+        put(K_F, JSON.stringify(merge(read(K_F), st.favorites)));
+        const bear = st.bear || {};
+        if (bear.state && bear.state.bear) {
+            const cur = read(K_B);
+            if (!cur || (bear.state.savedAt || 0) > (cur.savedAt || 0)) put(K_B, JSON.stringify(bear.state));
+        }
+        if (bear.love > (+localStorage.getItem(K_L) || 0)) put(K_L, String(bear.love));
+        return changed;
+    }
+
+    async function pull(first) {
+        if (!ok || busy) return;
+        busy++;
+        try {
+            if (!code) {
+                const r = await api('new', {});
+                if (!r || !r.ok) throw new Error('new');
+                code = r.code;
+                raw(K_CODE, code);
+                await api('push', { code, state: pack() });
+                status = '已同步';
+            } else {
+                const r = await api('pull', { code });
+                if (!r.ok) {
+                    // 码在服务器上没了（换了服务器/存档被清）：用本机进度重新登记一个
+                    status = '';
+                    code = ''; localStorage.removeItem(K_CODE);
+                    setTimeout(() => pull(false), 0);
+                    return;
+                }
+                const changed = apply(r.state);
+                status = '已同步';
+                // 新设备第一次接回进度：刷新一次让页面按新进度重画（防循环）
+                if (first && changed && !sessionStorage.getItem('yc_sync_reloaded')) {
+                    sessionStorage.setItem('yc_sync_reloaded', '1');
+                    location.reload();
+                    return;
+                }
+                dirty = true; // 合并后的本机进度（含离线时攒的）再传一次
+            }
+            paint();
+        } catch (e) {
+            // 连不上服务器：进度照常存本机，状态标离线，之后自动重试
+            status = '离线'; paint();
+        } finally { busy--; if (dirty && status === '已同步') { dirty = false; push(); } }
+    }
+
+    function push() {
+        if (!ok || !code) return;
+        if (busy) { dirty = true; return; }
+        clearTimeout(pushT);
+        pushT = setTimeout(async () => {
+            busy++;
+            try { await api('push', { code, state: pack() }); status = '已同步'; }
+            catch (e) { status = '离线'; }
+            finally { busy--; paint(); if (dirty) { dirty = false; push(); } }
+        }, 600);
+    }
+
+    // 熊的存档补一个时间戳，服务器才知道哪台设备更新
+    Storage.prototype.setItem = function (k, v) {
+        if (this === localStorage && k === K_B && typeof v === 'string' && v.charAt(0) === '{') {
+            try { const o = JSON.parse(v); o.savedAt = Date.now(); v = JSON.stringify(o); } catch (e) {}
+        }
+        setItem.call(this, k, v);
+        if (this === localStorage && (k === K_T || k === K_F || k === K_B || k === K_L)) push();
+    };
+
+    function paint() {
+        if (!chip) return;
+        const b = chip.querySelector('b');
+        b.textContent = code || '—';
+        chip.title = status === '离线' ? '服务器没开，进度先存在本机，开了会自动传上去' : (status || '同步中') + ' · 点这里看同步码 / 在别的设备接回进度';
+        chip.classList.toggle('bad', !code || status === '离线');
+        chip.classList.toggle('good', !!code && status === '已同步');
+    }
+
+    function mount() {
+        const bar = document.getElementById('bearEntry');
+        if (!bar || !ok) return;
+        chip = document.createElement('button');
+        chip.id = 'ycSyncChip';
+        chip.type = 'button';
+        chip.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M20 12a8 8 0 0 1-13.6 5.7M4 12a8 8 0 0 1 13.6-5.7"/><path d="M17 3v4h-4M7 21v-4h4"/></svg><span>同步码</span><b>—</b>';
+        chip.addEventListener('click', async e => {
+            e.stopPropagation();
+            const c = prompt('这是你的同步码（已复制）。\n在别的电脑/浏览器打开教程站，点这里输入同一个码，进度和小熊就接回来了。\n\n要接回别处的进度：把下面换成那边的码再点确定。', code);
+            if (c === null) return;
+            const t = c.trim().toUpperCase();
+            if (!t || t === code) return;
+            if (!/^[A-Z0-9]{6}$/.test(t)) { alert('同步码是 6 位字母数字'); return; }
+            const r = await api('pull', { code: t }).catch(() => 'off');
+            if (r === 'off') { alert('服务器暂时连不上，等它开了再输'); return; }
+            if (!r || !r.ok) { alert('没有这个同步码'); return; }
+            code = t; raw(K_CODE, code); apply(r.state);
+            sessionStorage.setItem('yc_sync_reloaded', '1');
+            location.reload();
+        });
+        chip.addEventListener('pointerdown', () => { if (code && navigator.clipboard) navigator.clipboard.writeText(code).catch(() => {}); });
+        bar.appendChild(chip);
+        paint();
+    }
+
+    // 熊住在 iframe 里，它自己的 localStorage.setItem 不经过这里，由宿主在 saved() 时转一手
+    function bearSaved() {
+        const v = localStorage.getItem(K_B);
+        if (v) localStorage.setItem(K_B, v);
+    }
+
+    window.YCSync = { get code() { return code; }, get status() { return status; }, pull: () => pull(false), push, bearSaved };
+
+    if (ok) {
+        pull(true);
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) pull(false); });
+        // 服务器没开时进度照常存本机；开了之后自动补传
+        setInterval(() => { if (ok && status !== '已同步' && !document.hidden) pull(false); }, 30000);
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount);
+    else mount();
+})();
+// <</YC-SYNC>>
+</script>
 </head>
 <body>
     <!-- 梦幻背景 -->
@@ -2986,7 +3163,7 @@
         petLove: () => +localStorage.getItem('bear_love') || 0,
         learned: count,
         isOpen: () => isOpen,
-        saved() { clearTimeout(syncT); syncT = setTimeout(sync, 120); },
+        saved() { clearTimeout(syncT); syncT = setTimeout(sync, 120); if (window.YCSync) window.YCSync.bearSaved(); },
         close,
         ready() {
             BH = fr.contentWindow.BH;
